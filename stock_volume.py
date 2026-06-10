@@ -4,8 +4,11 @@ A 股主板+创业板 成交量异动扫描工具（akshare 多线程版）。
 """
 
 import json
+import os
 import random
+import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -53,8 +56,8 @@ EXCLUDE_SUSPENDED = True
 # 设为 0 表示不过滤；如设 100 表示基期日均至少 100 万手
 MIN_AVG_VOLUME = 0
 
-# 并发线程数（akshare 是 HTTP 请求，IO 密集型，可以设大一些）
-WORKERS = min(15, max(1, cpu_count() - 1))
+# 并发线程数（akshare 是 HTTP 请求，IO 密集型，但东财接口有并发限流）
+WORKERS = 15
 
 # 单只股票网络请求失败时的重试次数
 MAX_RETRIES = 2
@@ -67,7 +70,7 @@ REQUEST_DELAY_MAX = 0
 RETRY_BACKOFF = 1.0
 
 # 线程启动错峰（秒），worker 上线前随机等一会儿，避免所有线程同时发第一枪
-WORKER_START_DELAY = 2.0
+WORKER_START_DELAY = 0.0
 
 # ── 策略开关 ──
 ENABLE_VOLUME_SURGE = True   # 成交量异动策略
@@ -80,6 +83,17 @@ VOL_MULTIPLIER = 1.5  # 当日成交量需 ≥ 短期日均量的 N 倍
 
 # ── 扫描缓存文件 ──
 SCAN_CACHE_FILE = "scan_cache.json"  # 固定文件名，存放扫描命中的股票代码
+
+# ── 历史数据本地缓存 ──
+CACHE_DB = "stock_cache.db"          # SQLite 缓存，存放每只股票的日线数据
+CACHE_MAX_AGE_DAYS = 4               # 缓存最大有效期，覆盖周末（周五→周一差3天）
+
+
+# 去除代理（macOS 系统代理会干扰 curl_cffi/libcurl 的连接）
+for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
+    os.environ.pop(k, None)
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -138,6 +152,68 @@ def _to_sina_code(stock_code: str) -> str:
     return f"sh{stock_code}" if stock_code.startswith("6") else f"sz{stock_code}"
 
 
+# ── 本地缓存层 ──────────────────────────────────────
+
+_cache_lock = threading.Lock()
+
+def _init_cache_db() -> sqlite3.Connection:
+    """初始化 SQLite 缓存数据库。
+
+    如果表不存在则创建，同时清理 60 天前的过期数据。
+    """
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_daily (
+            code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            close REAL NOT NULL,
+            volume INTEGER NOT NULL,
+            PRIMARY KEY (code, date)
+        )
+    """)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("DELETE FROM stock_daily WHERE date < date('now', '-60 days')")
+    conn.commit()
+    return conn
+
+
+def _get_cached_stock(code: str, min_date: str) -> pd.DataFrame | None:
+    """从缓存读取某只股票指定日期起的日线数据。
+
+    Args:
+        code: 股票代码
+        min_date: 起始日期 "YYYY-MM-DD"
+
+    Returns:
+        DataFrame[日期, 收盘, 成交量] 或 None。
+    """
+    conn = _init_cache_db()
+    cursor = conn.execute(
+        "SELECT date, close, volume FROM stock_daily WHERE code = ? AND date >= ? ORDER BY date",
+        (code, min_date),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        return None
+    return pd.DataFrame(rows, columns=["日期", "收盘", "成交量"])
+
+
+def _cache_stock_data(code: str, df: pd.DataFrame):
+    """将单只股票的日线数据写入本地缓存。
+
+    使用 _cache_lock 防止多线程并发写入 SQLite 时出现锁竞争。
+    """
+    with _cache_lock:
+        conn = _init_cache_db()
+        conn.executemany(
+            "INSERT OR REPLACE INTO stock_daily (code, date, close, volume) VALUES (?, ?, ?, ?)",
+            [(code, str(row["日期"]), float(row["收盘"]), int(row["成交量"])) for _, row in df.iterrows()],
+        )
+        conn.commit()
+        conn.close()
+
+
 def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
     """查询单只股票的历史日线数据（东方财富优先，新浪兜底）。
 
@@ -154,6 +230,13 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
     total_needed_days = AVG_DAYS + CHECK_DAYS + EXTRA_DAYS
     start = today - timedelta(days=total_needed_days)
 
+    # ── 尝试从本地缓存读取 ──
+    cached = _get_cached_stock(stock_code, start.strftime("%Y-%m-%d"))
+    if cached is not None and len(cached) >= AVG_DAYS + CHECK_DAYS:
+        latest_dt = datetime.strptime(str(cached["日期"].iloc[-1]), "%Y-%m-%d")
+        if (today - latest_dt).days <= CACHE_MAX_AGE_DAYS:
+            return cached
+
     # ── 第1层：东方财富（主） ──
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -165,7 +248,9 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
                 end_date=today.strftime("%Y%m%d"),
             )
             if df is not None and not df.empty:
-                return df[["日期", "收盘", "成交量"]].copy()
+                df = df[["日期", "收盘", "成交量"]].copy()
+                _cache_stock_data(stock_code, df)
+                return df
             # 空数据不算失败，直接尝试下一层
             break
         except Exception:
@@ -192,7 +277,7 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
             data = r.json()
 
             if not data or not isinstance(data, list):
-                return None
+                break
 
             rows = []
             for item in data:
@@ -203,13 +288,61 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
                 })
 
             df = pd.DataFrame(rows)
-            return df if not df.empty else None
+            if not df.empty:
+                _cache_stock_data(stock_code, df)
+                return df
+            break
 
         except Exception:
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF * (2 ** attempt))
                 continue
-            return None
+            break
+
+    # ── 第3层：Baostock（兜底） ──
+    try:
+        import baostock as bs
+
+        prefix = "sh" if stock_code.startswith("6") else "sz"
+        bs_code = f"{prefix}.{stock_code}"
+
+        lg = bs.login()
+        if lg.error_code == "0":
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,close,volume",
+                start_date=start.strftime("%Y-%m-%d"),
+                end_date=today.strftime("%Y-%m-%d"),
+                frequency="d",
+                adjustflag="2",
+            )
+
+            rows = []
+            while rs.next():
+                row = rs.get_row_data()
+                if row[0] is None or row[0] == "":
+                    continue
+                rows.append({
+                    "日期": row[0],
+                    "收盘": float(row[1]),
+                    "成交量": int(float(row[2])) // 100,  # 股 → 手
+                })
+
+            bs.logout()
+
+            if rows:
+                df = pd.DataFrame(rows)
+                _cache_stock_data(stock_code, df)
+                return df
+        else:
+            bs.logout()
+    except Exception:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    return None
 
 
 def check_volume_surge(df: pd.DataFrame) -> dict | None:
