@@ -5,14 +5,11 @@ A 股主板+创业板 成交量异动扫描工具（akshare 多线程版）。
 
 import json
 import os
-import random
 import sqlite3
 import sys
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from multiprocessing import cpu_count
 
 import akshare as ak
 import numpy as np
@@ -56,21 +53,8 @@ EXCLUDE_SUSPENDED = True
 # 设为 0 表示不过滤；如设 100 表示基期日均至少 100 万手
 MIN_AVG_VOLUME = 0
 
-# 并发线程数（akshare 是 HTTP 请求，IO 密集型，但东财接口有并发限流）
+# 并发线程数
 WORKERS = 15
-
-# 单只股票网络请求失败时的重试次数
-MAX_RETRIES = 2
-
-# 请求前随机延时（秒），新浪接口无需延时，东财重试用
-REQUEST_DELAY_MIN = 0
-REQUEST_DELAY_MAX = 0
-
-# 重试退避基数（秒），接口失败后等待 base * 2^attempt 秒再重试
-RETRY_BACKOFF = 1.0
-
-# 线程启动错峰（秒），worker 上线前随机等一会儿，避免所有线程同时发第一枪
-WORKER_START_DELAY = 0.0
 
 # ── 策略开关 ──
 ENABLE_VOLUME_SURGE = True   # 成交量异动策略
@@ -155,6 +139,7 @@ def _to_sina_code(stock_code: str) -> str:
 # ── 本地缓存层 ──────────────────────────────────────
 
 _cache_lock = threading.Lock()
+_bs_lock = threading.Lock()
 
 def _init_cache_db() -> sqlite3.Connection:
     """初始化 SQLite 缓存数据库。
@@ -215,12 +200,13 @@ def _cache_stock_data(code: str, df: pd.DataFrame):
 
 
 def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
-    """查询单只股票的历史日线数据（东方财富优先，新浪兜底）。
+    """查询单只股票的历史日线数据（Baostock → 东方财富 → 新浪）。
 
     策略:
-        1. 优先使用东方财富 (akshare)，最多尝试 MAX_RETRIES+1 次
-        2. 全部失败后降级到新浪，最多尝试 MAX_RETRIES+1 次
-        3. 全部失败返回 None
+        1. 优先 Baostock（TCP 直连，稳定可靠）
+        2. 失败后降级到东方财富 (akshare)
+        3. 再失败降级到新浪
+        所有路径失败返回 None。
 
     返回:
         DataFrame，列名为 ["日期", "收盘", "成交量"]，按日期正序排列；
@@ -237,79 +223,14 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
         if (today - latest_dt).days <= CACHE_MAX_AGE_DAYS:
             return cached
 
-    # ── 第1层：东方财富（主） ──
-    for attempt in range(MAX_RETRIES + 1):
+    # ── 第1层：Baostock（全局连接 + 锁，避免每只股票重复 login/logout） ──
+    with _bs_lock:
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                adjust="",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=today.strftime("%Y%m%d"),
-            )
-            if df is not None and not df.empty:
-                df = df[["日期", "收盘", "成交量"]].copy()
-                _cache_stock_data(stock_code, df)
-                return df
-            # 空数据不算失败，直接尝试下一层
-            break
-        except Exception:
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                continue
-            # 3次全失败 → 降级
-            break
+            import baostock as bs
 
-    # ── 第2层：新浪（兜底） ──
-    sina_code = _to_sina_code(stock_code)
-    datalen = AVG_DAYS + CHECK_DAYS + EXTRA_DAYS
-    url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    params = {"symbol": sina_code, "scale": "240", "ma": "no", "datalen": datalen}
-    headers = {
-        "Referer": "http://finance.sina.com.cn",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    }
-
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            r.encoding = "gbk"
-            data = r.json()
-
-            if not data or not isinstance(data, list):
-                break
-
-            rows = []
-            for item in data:
-                rows.append({
-                    "日期": item["day"],
-                    "收盘": float(item["close"]),
-                    "成交量": int(float(item["volume"])) // 100,
-                })
-
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                _cache_stock_data(stock_code, df)
-                return df
-            break
-
-        except Exception:
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                continue
-            break
-
-    # ── 第3层：Baostock（兜底） ──
-    try:
-        import baostock as bs
-
-        prefix = "sh" if stock_code.startswith("6") else "sz"
-        bs_code = f"{prefix}.{stock_code}"
-
-        lg = bs.login()
-        if lg.error_code == "0":
+            prefix = "sh" if stock_code.startswith("6") else "sz"
             rs = bs.query_history_k_data_plus(
-                bs_code,
+                f"{prefix}.{stock_code}",
                 "date,close,volume",
                 start_date=start.strftime("%Y-%m-%d"),
                 end_date=today.strftime("%Y-%m-%d"),
@@ -328,19 +249,57 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
                     "成交量": int(float(row[2])) // 100,  # 股 → 手
                 })
 
-            bs.logout()
-
             if rows:
                 df = pd.DataFrame(rows)
                 _cache_stock_data(stock_code, df)
                 return df
-        else:
-            bs.logout()
-    except Exception:
-        try:
-            bs.logout()
         except Exception:
             pass
+
+    # ── 第2层：东方财富 ──
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=stock_code,
+            period="daily",
+            adjust="",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=today.strftime("%Y%m%d"),
+        )
+        if df is not None and not df.empty:
+            df = df[["日期", "收盘", "成交量"]].copy()
+            _cache_stock_data(stock_code, df)
+            return df
+    except Exception:
+        pass
+
+    # ── 第3层：新浪 ──
+    sina_code = _to_sina_code(stock_code)
+    datalen = AVG_DAYS + CHECK_DAYS + EXTRA_DAYS
+    url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+    params = {"symbol": sina_code, "scale": "240", "ma": "no", "datalen": datalen}
+    headers = {
+        "Referer": "http://finance.sina.com.cn",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.encoding = "gbk"
+        data = r.json()
+
+        if data and isinstance(data, list):
+            rows = [{
+                "日期": item["day"],
+                "收盘": float(item["close"]),
+                "成交量": int(float(item["volume"])) // 100,
+            } for item in data]
+
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                _cache_stock_data(stock_code, df)
+                return df
+    except Exception:
+        pass
 
     return None
 
@@ -560,10 +519,6 @@ def _worker(stock: dict) -> dict | None:
         return None
 
     try:
-        # 线程启动错峰：随机等待，避免所有线程同时发起第一个请求
-        startup_delay = random.uniform(0, WORKER_START_DELAY)
-        time.sleep(startup_delay)
-
         df = _query_stock_hist(stock["code"])
         if df is None or df.empty:
             return None
@@ -678,6 +633,17 @@ def scan_all_stocks() -> dict:
     print(f"线程数: {WORKERS}")
     print()
 
+    # Baostock 全局登录（线程共享连接，串行查询）
+    _bs_ready = False
+    try:
+        import baostock as bs
+        r = bs.login()
+        _bs_ready = r.error_code == "0"
+        if not _bs_ready:
+            print(f"Baostock 登录失败: {r.error_msg}")
+    except Exception as e:
+        print(f"Baostock 不可用: {e}")
+
     hits = []
     total = len(stocks)
     done = 0
@@ -696,6 +662,13 @@ def scan_all_stocks() -> dict:
                     hits.append(result)
             except Exception:
                 errors += 1
+
+    # 关闭 Baostock 全局连接
+    if _bs_ready:
+        try:
+            bs.logout()
+        except Exception:
+            pass
 
     if errors > 0:
         print(f"异常数: {errors}")
