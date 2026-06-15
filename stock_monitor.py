@@ -18,7 +18,7 @@ import requests
 # ═══════════════════════════════════════════════════════════
 
 # 扫描缓存文件路径（与 stock_volume.py 共用）
-SCAN_CACHE_FILE = "scan_cache.json"
+SCAN_CACHE_FILE = "db/scan_cache.json"
 
 # 接口不可用定义：连续失败 N+1 次后降级
 MAX_RETRIES = 2

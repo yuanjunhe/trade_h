@@ -28,12 +28,12 @@ CHECK_DAYS = 2
 AVG_DAYS = 22
 
 # 放量倍数范围：检查期每天的成交量需大于基期对应天成交量的 MULTIPLIER_MIN 倍
-MULTIPLIER_MIN = 1.8
+MULTIPLIER_MIN = 2.1
 MULTIPLIER_MAX = 0  # 0 表示不设上限
 
 # 逐日对比通过率：检查期每天与基期逐一对比，至少需要多少比例的基期日满足倍数条件
 # 例：0.8 表示只要战胜基期中 80% 的天数就算通过，可容忍 20% 的基期异常数据
-PASS_RATIO = 0.8
+PASS_RATIO = 0.85
 
 # 查询历史数据时多取的自然日天数（用于覆盖周末/节假日，一般不用改）
 EXTRA_DAYS = 10
@@ -66,11 +66,17 @@ MA_LONG = 20          # 中期均线天数（趋势确认）
 VOL_MULTIPLIER = 1.5  # 当日成交量需 ≥ 短期日均量的 N 倍
 
 # ── 扫描缓存文件 ──
-SCAN_CACHE_FILE = "scan_cache.json"  # 固定文件名，存放扫描命中的股票代码
+SCAN_CACHE_FILE = "db/scan_cache.json"  # 固定文件名，存放扫描命中的股票代码
 
 # ── 历史数据本地缓存 ──
-CACHE_DB = "stock_cache.db"          # SQLite 缓存，存放每只股票的日线数据
+CACHE_DB = "db/stock_cache.db"          # SQLite 缓存，存放每只股票的日线数据
 CACHE_MAX_AGE_DAYS = 4               # 缓存最大有效期，覆盖周末（周五→周一差3天）
+CACHE_INCREMENTAL = True             # 缓存命中但数据不够新时，增量拉取缺失天数
+EXCLUDE_TODAY_INTRADAY = True        # 盘中（15:00前）排除当天不完整数据
+
+# ── Baostock 超时 ──
+BAOSTOCK_TIMEOUT = 15                # Baostock 单股查询超时（秒），防止卡死
+HTTP_TIMEOUT = 15                    # HTTP 数据源（akshare/新浪）超时（秒）
 
 
 # 去除代理（macOS 系统代理会干扰 curl_cffi/libcurl 的连接）
@@ -141,6 +147,29 @@ def _to_sina_code(stock_code: str) -> str:
 _cache_lock = threading.Lock()
 _bs_lock = threading.Lock()
 
+# ── 线程本地连接池（每线程复用一个 SQLite 连接，避免重复 open/close） ──
+_thread_local = threading.local()
+
+
+def _get_cache_conn():
+    """获取当前线程的缓存连接（懒初始化、复用）。"""
+    conn = getattr(_thread_local, "cache_conn", None)
+    if conn is None:
+        conn = sqlite3.connect(CACHE_DB, check_same_thread=False)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stock_daily (
+                code TEXT NOT NULL,
+                date TEXT NOT NULL,
+                close REAL NOT NULL,
+                volume INTEGER NOT NULL,
+                PRIMARY KEY (code, date)
+            )
+        """)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        _thread_local.cache_conn = conn
+    return conn
+
 def _init_cache_db() -> sqlite3.Connection:
     """初始化 SQLite 缓存数据库。
 
@@ -172,13 +201,12 @@ def _get_cached_stock(code: str, min_date: str) -> pd.DataFrame | None:
     Returns:
         DataFrame[日期, 收盘, 成交量] 或 None。
     """
-    conn = _init_cache_db()
+    conn = _get_cache_conn()
     cursor = conn.execute(
         "SELECT date, close, volume FROM stock_daily WHERE code = ? AND date >= ? ORDER BY date",
         (code, min_date),
     )
     rows = cursor.fetchall()
-    conn.close()
     if not rows:
         return None
     return pd.DataFrame(rows, columns=["日期", "收盘", "成交量"])
@@ -187,16 +215,107 @@ def _get_cached_stock(code: str, min_date: str) -> pd.DataFrame | None:
 def _cache_stock_data(code: str, df: pd.DataFrame):
     """将单只股票的日线数据写入本地缓存。
 
-    使用 _cache_lock 防止多线程并发写入 SQLite 时出现锁竞争。
+    使用线程本地连接，避免多线程重复创建/关闭 SQLite 连接。
     """
-    with _cache_lock:
-        conn = _init_cache_db()
-        conn.executemany(
-            "INSERT OR REPLACE INTO stock_daily (code, date, close, volume) VALUES (?, ?, ?, ?)",
-            [(code, str(row["日期"]), float(row["收盘"]), int(row["成交量"])) for _, row in df.iterrows()],
+    conn = _get_cache_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO stock_daily (code, date, close, volume) VALUES (?, ?, ?, ?)",
+        [(code, str(row["日期"]), float(row["收盘"]), int(row["成交量"])) for _, row in df.iterrows()],
+    )
+    conn.commit()
+
+
+def _call_with_timeout(fn, timeout, *args, **kwargs):
+    """在 daemon 线程中执行 fn，主线程等待 timeout 秒后超时返回 None。
+
+    用于保护无超时参数的第三方 HTTP 调用（akshare），防止网络卡死。
+    """
+    result = [None]
+    error = [None]
+
+    def _do():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return None  # 超时
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
+def _incremental_fetch(stock_code: str, from_date: str, to_date: str) -> pd.DataFrame | None:
+    """增量拉取 from_date 到 to_date 之间的数据（快速通道，跳过 Baostock）。
+
+    仅使用东方财富和新浪两个 HTTP 源，带超时保护，失败或超时返回 None。
+    """
+    # 第1层：东方财富（最快）
+    try:
+        df = _call_with_timeout(
+            ak.stock_zh_a_hist, HTTP_TIMEOUT,
+            symbol=stock_code, period="daily", adjust="",
+            start_date=from_date.replace("-", ""), end_date=to_date.replace("-", ""),
         )
-        conn.commit()
-        conn.close()
+        if df is not None and not df.empty:
+            return df[["日期", "收盘", "成交量"]].copy()
+    except Exception:
+        pass
+
+    # 第2层：新浪
+    try:
+        sina_code = _to_sina_code(stock_code)
+        delta = (datetime.strptime(to_date, "%Y-%m-%d") - datetime.strptime(from_date, "%Y-%m-%d")).days
+        datalen = max(delta + 5, 10)
+        url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": sina_code, "scale": "240", "ma": "no", "datalen": datalen}
+        headers = {
+            "Referer": "http://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        }
+
+        def _fetch_sina():
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r.encoding = "gbk"
+            return r.json()
+
+        data = _call_with_timeout(_fetch_sina, HTTP_TIMEOUT)
+
+        if data and isinstance(data, list):
+            rows = [{
+                "日期": item["day"],
+                "收盘": float(item["close"]),
+                "成交量": int(float(item["volume"])) // 100,
+            } for item in data]
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df = df[(df["日期"] >= from_date) & (df["日期"] <= to_date)]
+            return df if not df.empty else None
+    except Exception:
+        pass
+
+    return None
+
+
+def _filter_incomplete_today(df: pd.DataFrame) -> pd.DataFrame:
+    """盘中过滤当天不完整的成交量数据。
+
+    交易日 15:00 前，当天成交量还在累计中，不代表全天真实成交，
+    直接参与放量检测会导致结果失真。此函数在盘中删掉当天行。
+
+    非交易日或盘后（≥15:00）不做过滤。
+    """
+    if not EXCLUDE_TODAY_INTRADAY or df is None or df.empty:
+        return df
+    now = datetime.now()
+    if now.weekday() < 5 and now.hour < 15:
+        today_str = now.strftime("%Y-%m-%d")
+        df = df[df["日期"] != today_str]
+    return df
 
 
 def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
@@ -221,49 +340,84 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
     if cached is not None and len(cached) >= AVG_DAYS + CHECK_DAYS:
         latest_dt = datetime.strptime(str(cached["日期"].iloc[-1]), "%Y-%m-%d")
         if (today - latest_dt).days <= CACHE_MAX_AGE_DAYS:
+            # 缓存命中，检查是否缺了最新交易日数据
+            if CACHE_INCREMENTAL and latest_dt.date() < today.date():
+                inc = _incremental_fetch(
+                    stock_code,
+                    (latest_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+                    today.strftime("%Y-%m-%d"),
+                )
+                if inc is not None and not inc.empty:
+                    # 合并新旧数据，去重后写回缓存
+                    # 确保日期列类型一致（akshare 可能返回 date 对象而非 str）
+                    cached["日期"] = cached["日期"].astype(str)
+                    inc["日期"] = inc["日期"].astype(str)
+                    merged = pd.concat([cached, inc], ignore_index=True)
+                    merged = merged.drop_duplicates(subset=["日期"], keep="last")
+                    merged = merged.sort_values("日期").reset_index(drop=True)
+                    _cache_stock_data(stock_code, inc)
+                    return merged
             return cached
 
-    # ── 第1层：Baostock（全局连接 + 锁，避免每只股票重复 login/logout） ──
+    # ── 第1层：Baostock（带超时，防止单股请求卡死拖垮所有线程） ──
+    def _bs_query():
+        """在 daemon 线程中执行 Baostock 查询，主线程超时即跳过。"""
+        import baostock as bs
+        prefix = "sh" if stock_code.startswith("6") else "sz"
+        return bs.query_history_k_data_plus(
+            f"{prefix}.{stock_code}",
+            "date,close,volume",
+            start_date=start.strftime("%Y-%m-%d"),
+            end_date=today.strftime("%Y-%m-%d"),
+            frequency="d",
+            adjustflag="2",
+        )
+
     with _bs_lock:
         try:
-            import baostock as bs
+            _result = [None]
+            _error = [None]
 
-            prefix = "sh" if stock_code.startswith("6") else "sz"
-            rs = bs.query_history_k_data_plus(
-                f"{prefix}.{stock_code}",
-                "date,close,volume",
-                start_date=start.strftime("%Y-%m-%d"),
-                end_date=today.strftime("%Y-%m-%d"),
-                frequency="d",
-                adjustflag="2",
-            )
+            def _do():
+                try:
+                    _result[0] = _bs_query()
+                except Exception as e:
+                    _error[0] = e
 
-            rows = []
-            while rs.next():
-                row = rs.get_row_data()
-                if row[0] is None or row[0] == "":
-                    continue
-                rows.append({
-                    "日期": row[0],
-                    "收盘": float(row[1]),
-                    "成交量": int(float(row[2])) // 100,  # 股 → 手
-                })
+            t = threading.Thread(target=_do, daemon=True)
+            t.start()
+            t.join(timeout=BAOSTOCK_TIMEOUT)
 
-            if rows:
-                df = pd.DataFrame(rows)
-                _cache_stock_data(stock_code, df)
-                return df
+            if t.is_alive():
+                pass  # 超时，跳过该股票，daemon 线程自行结束
+            elif _error[0] is not None:
+                raise _error[0]
+            else:
+                rs = _result[0]
+                rows = []
+                while rs.next():
+                    row = rs.get_row_data()
+                    if row[0] is None or row[0] == "":
+                        continue
+                    rows.append({
+                        "日期": row[0],
+                        "收盘": float(row[1]),
+                        "成交量": int(float(row[2])) // 100,  # 股 → 手
+                    })
+
+                if rows:
+                    df = pd.DataFrame(rows)
+                    _cache_stock_data(stock_code, df)
+                    return df
         except Exception:
             pass
 
     # ── 第2层：东方财富 ──
     try:
-        df = ak.stock_zh_a_hist(
-            symbol=stock_code,
-            period="daily",
-            adjust="",
-            start_date=start.strftime("%Y%m%d"),
-            end_date=today.strftime("%Y%m%d"),
+        df = _call_with_timeout(
+            ak.stock_zh_a_hist, HTTP_TIMEOUT,
+            symbol=stock_code, period="daily", adjust="",
+            start_date=start.strftime("%Y%m%d"), end_date=today.strftime("%Y%m%d"),
         )
         if df is not None and not df.empty:
             df = df[["日期", "收盘", "成交量"]].copy()
@@ -273,19 +427,22 @@ def _query_stock_hist(stock_code: str) -> pd.DataFrame | None:
         pass
 
     # ── 第3层：新浪 ──
-    sina_code = _to_sina_code(stock_code)
-    datalen = AVG_DAYS + CHECK_DAYS + EXTRA_DAYS
-    url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
-    params = {"symbol": sina_code, "scale": "240", "ma": "no", "datalen": datalen}
-    headers = {
-        "Referer": "http://finance.sina.com.cn",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    }
-
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        r.encoding = "gbk"
-        data = r.json()
+        sina_code = _to_sina_code(stock_code)
+        datalen = AVG_DAYS + CHECK_DAYS + EXTRA_DAYS
+        url = "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+        params = {"symbol": sina_code, "scale": "240", "ma": "no", "datalen": datalen}
+        headers = {
+            "Referer": "http://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        }
+
+        def _fetch_sina():
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r.encoding = "gbk"
+            return r.json()
+
+        data = _call_with_timeout(_fetch_sina, HTTP_TIMEOUT)
 
         if data and isinstance(data, list):
             rows = [{
@@ -523,6 +680,11 @@ def _worker(stock: dict) -> dict | None:
         if df is None or df.empty:
             return None
 
+        # 盘中过滤当天不完整数据，过滤后数据不足则跳过
+        df = _filter_incomplete_today(df)
+        if df is None or df.empty or len(df) < AVG_DAYS + CHECK_DAYS:
+            return None
+
         # 排除停牌股（最近 5 天成交量全为 0）
         if EXCLUDE_SUSPENDED and len(df) >= 5:
             if (df.tail(5)["成交量"] == 0).all():
@@ -669,6 +831,15 @@ def scan_all_stocks() -> dict:
             bs.logout()
         except Exception:
             pass
+
+    # 清理线程本地 SQLite 连接
+    conn = getattr(_thread_local, "cache_conn", None)
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        del _thread_local.cache_conn
 
     if errors > 0:
         print(f"异常数: {errors}")
@@ -898,8 +1069,10 @@ if __name__ == "__main__":
     else:
         code = sys.argv[2] if len(sys.argv) > 2 else "300750"
         rows = _query_stock_hist(code)
+        if rows is not None and not rows.empty:
+            rows = _filter_incomplete_today(rows)
 
-        if rows is None:
+        if rows is None or rows.empty:
             print(f"获取股票 {code} 数据失败。")
         else:
             # 成交量异动策略

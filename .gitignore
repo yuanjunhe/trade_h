@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SQLite WAL mode (journal files only — keep the main db synced across machines)
+db/stock_cache.db-wal
+db/stock_cache.db-shm
+db/scan_cache.json
