@@ -1,0 +1,98 @@
+# ============================================================
+# Quantitative Stock Selection System Configuration
+# ============================================================
+
+data:
+  # Data source priority: "akshare" / "baostock"
+  primary_source: "baostock"
+  # HTTP timeout for external calls (seconds)
+  timeout: 15
+  # Retry settings
+  retry_count: 3
+  retry_backoff_base: 2.0        # exponential: 2s, 4s, 8s
+  # Rate limiting: min delay between HTTP requests (seconds)
+  rate_limit: 0.3
+  # Whether to fetch and store raw (unadjusted) prices
+  # When false, raw columns are set equal to adjusted
+  store_raw_prices: false
+  # Data retention: auto-delete data older than N days (0 = keep all)
+  retention_days: 0
+
+database:
+  path: "db/stock_data.db"
+  journal_mode: "wal"
+
+pipeline:
+  # Download pipeline
+  download:
+    workers: 10
+    chunk_size: 200
+    exclude_today_intraday: true
+  # Incremental update
+  update:
+    workers: 15
+    lookback_days: 5
+
+strategies:
+  volume_surge:
+    enabled: true
+    check_days: 2
+    avg_days: 22
+    multiplier_min: 2.1
+    multiplier_max: 0            # 0 = no upper limit
+    pass_ratio: 0.85
+
+  ma_breakout:
+    enabled: true
+    ma_short: 5
+    ma_long: 20
+    vol_multiplier: 1.5
+
+  ma_crossover:
+    enabled: false
+    fast_ma: 5
+    slow_ma: 20
+    confirmation_days: 1
+    direction: "golden"           # "golden" / "death" / "both"
+
+  divergence:
+    enabled: false
+    lookback: 30
+    volume_shrink_threshold: 0.7
+    price_peak_window: 5
+
+  momentum:
+    enabled: false
+    period: 20
+    roc_threshold: 0.05          # 5% minimum price change
+    require_volume: true
+    volume_multiplier: 1.2
+
+scan:
+  boards:
+    sh_main: false
+    sz_main: false
+    chi: true
+    kcb: false
+  exclude_st: true
+  exclude_suspended: true
+  min_avg_volume: 0              # minimum avg daily volume in 万手 (0=no filter)
+
+output:
+  console:
+    max_rows: 50
+  csv:
+    enabled: true
+    filename: "output/candidates.csv"
+  excel:
+    enabled: false
+    filename: "output/candidates.xlsx"
+  db_cache:
+    enabled: true
+  text_log:
+    enabled: true
+    directory: "output/"
+
+notification:
+  enabled: false
+  type: null                     # email / wechat / null
