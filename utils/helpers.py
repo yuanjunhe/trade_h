@@ -230,3 +230,25 @@ def filter_incomplete_today(df, exclude: bool = True):
         today_str = now.strftime("%Y-%m-%d")
         df = df[df["日期"] != today_str]
     return df
+
+
+def get_recent_field(hit: dict, field: str, default=None):
+    """从命中记录中提取第一个策略最近一天的字段值。
+
+    遍历 hit["strategies"]，找到第一个包含非空 recent 数组的策略，
+    返回 recent[-1][field]。
+
+    参数:
+        hit: 扫描命中记录字典。
+        field: 要提取的字段名，如 "date", "volume", "ratio"。
+        default: 未找到时的默认值。
+
+    返回:
+        字段值，或 default。
+    """
+    for strat_key in hit.get("strategies", []):
+        data = hit.get(strat_key, {})
+        recent = data.get("recent", [])
+        if recent and field in recent[-1]:
+            return recent[-1][field]
+    return default

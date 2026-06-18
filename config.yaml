@@ -37,13 +37,13 @@ strategies:
   volume_surge:
     enabled: true
     check_days: 2
-    avg_days: 22
+    avg_days: 10
     multiplier_min: 2.1
     multiplier_max: 0            # 0 = no upper limit
     pass_ratio: 0.85
 
   ma_breakout:
-    enabled: true
+    enabled: false
     ma_short: 5
     ma_long: 20
     vol_multiplier: 1.5

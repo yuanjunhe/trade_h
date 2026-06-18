@@ -8,14 +8,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
-from data.stock_list import filter_stocks, get_stock_list, sync_stock_info_to_db
+from data.stock_list import filter_stocks
 from strategy.combiner import (
     CombineLogic,
     StrategyCombiner,
     create_strategies_from_config,
 )
 from utils.config import cfg, get_config
-from utils.helpers import filter_incomplete_today
+from utils.helpers import filter_incomplete_today, get_recent_field
 
 logger = logging.getLogger("quant.scanner")
 
@@ -77,9 +77,12 @@ def scan_stocks(
 
     # 解析股票列表
     if stocks is None:
-        logger.info("加载股票列表...")
-        sync_stock_info_to_db(db)
-        df = get_stock_list()
+        logger.info("从数据库加载股票列表...")
+        df = db.get_stock_info_df()
+        if df.empty:
+            logger.warning("stock_info 表为空，请先运行 update 或 download")
+            return {"scan_time": start_time.isoformat(), "strategies": strat_names,
+                    "logic": logic, "hits": [], "stats": {}}
         boards = get_config().get("scan", {}).get("boards", {})
         exclude_st = get_config().get("scan", {}).get("exclude_st", True)
         df = filter_stocks(df, boards=boards, exclude_st=exclude_st)
@@ -92,6 +95,9 @@ def scan_stocks(
 
     conn = db.get_conn()
     hits = combiner.scan(conn, stocks)
+
+    # 按最近一天放量倍数倒序排列
+    hits.sort(key=_last_ratio, reverse=True)
 
     elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -114,6 +120,10 @@ def scan_stocks(
             "total_scanned": len(stocks),
             "total_hits": len(hits),
             "duration_seconds": round(elapsed, 1),
+        },
+        "strategy_params": {
+            name: {k: v for k, v in s.params.items() if k != "enabled"}
+            for name, s in zip(strat_names, strats)
         },
     }
 
@@ -144,3 +154,8 @@ def _post_filter(hits: list[dict], db, min_avg_volume: float,
 
         filtered.append(h)
     return filtered
+
+
+def _last_ratio(hit: dict) -> float:
+    """从命中记录中提取最近一天的放量倍数，用于排序。"""
+    return get_recent_field(hit, "ratio", 0)

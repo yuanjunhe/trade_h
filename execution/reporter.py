@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from utils.config import cfg
-from utils.helpers import format_pct, format_volume
+from utils.helpers import format_pct, format_volume, get_recent_field
 
 logger = logging.getLogger("quant.reporter")
 
@@ -65,13 +65,17 @@ def report_console(results: dict):
     logic = results.get("logic", "or")
     stats = results.get("stats", {})
 
-    strategy_str = " + ".join(strats) if strats else "None"
     logic_str = "AND" if logic == "and" else "OR"
 
     print()
     print("=" * 90)
     print(f"  扫描结果 — {results.get('scan_time', '')}")
-    print(f"  策略: {strategy_str}  (组合逻辑: {logic_str})")
+    print(f"  组合逻辑: {logic_str}")
+    strategy_params = results.get("strategy_params", {})
+    for s_name in strats:
+        params = strategy_params.get(s_name, {})
+        desc = _format_strategy_desc(s_name, params)
+        print(f"  策略 [{_STRATEGY_ABBR.get(s_name, s_name)}]: {desc}")
     print(f"  命中: {len(hits)} / {stats.get('total_scanned', 0)} 只  "
           f"耗时: {stats.get('duration_seconds', 0)}s")
     print("=" * 90)
@@ -174,12 +178,79 @@ def report_csv(results: dict):
 
 
 def _extract_date(hit: dict) -> str:
-    """从命中记录中提取日期。"""
+    """从命中记录中提取最近信号日期。"""
+    date = get_recent_field(hit, "date")
+    if date:
+        return str(date)
+    # 回退：策略顶层 date 字段
     for strat_key in hit.get("strategies", []):
-        strat_data = hit.get(strat_key, {})
-        if "date" in strat_data:
-            return strat_data["date"]
+        d = hit.get(strat_key, {}).get("date", "")
+        if d:
+            return str(d)
     return ""
+
+
+def _extract_volume(hit: dict) -> str:
+    """从命中记录中提取信号日成交量（格式化字符串）。"""
+    vol = get_recent_field(hit, "volume")
+    if vol:
+        return format_volume(vol)
+    # 回退：取平均成交量
+    for strat_key in hit.get("strategies", []):
+        avg = hit.get(strat_key, {}).get("avg_volume", 0)
+        if avg:
+            return format_volume(avg)
+    return "---"
+
+
+# 策略名缩写映射
+_STRATEGY_ABBR = {
+    "VolumeSurgeStrategy": "放量",
+    "MABreakoutStrategy": "突破",
+    "MACrossoverStrategy": "交叉",
+    "DivergenceStrategy": "背离",
+    "MomentumStrategy": "动量",
+}
+
+
+def _abbreviate_strategies(hit: dict) -> str:
+    """将策略名列表转为缩写字符串。"""
+    return ", ".join(
+        _STRATEGY_ABBR.get(s, s) for s in hit.get("strategies", [])
+    )
+
+
+def _format_strategy_desc(name: str, params: dict) -> str:
+    """将策略参数格式化为可读的中文描述。"""
+    if name == "VolumeSurgeStrategy":
+        check = params.get("check_days", 2)
+        avg = params.get("avg_days", 22)
+        mult_min = params.get("multiplier_min", 2.1)
+        mult_max = params.get("multiplier_max", 0)
+        ratio = params.get("pass_ratio", 0.85)
+        max_str = f" ~ {mult_max}" if mult_max > 0 else ""
+        return (f"最近 {check} 天 vs 过去 {avg} 天均值，"
+                f"放量倍数 ≥ {mult_min}{max_str}，"
+                f"通过率阈值 ≥ {ratio * 100:.0f}%")
+    elif name == "MABreakoutStrategy":
+        short = params.get("ma_short", 5)
+        long = params.get("ma_long", 20)
+        vol = params.get("vol_multiplier", 1.5)
+        return f"价格突破 MA{short}（基于 MA{long}），量比 ≥ {vol}"
+    elif name == "MACrossoverStrategy":
+        fast = params.get("fast_ma", 5)
+        slow = params.get("slow_ma", 20)
+        direction = params.get("direction", "golden")
+        dir_cn = {"golden": "金叉", "death": "死叉", "both": "双向"}.get(direction, direction)
+        return f"MA{fast} 与 MA{slow} {dir_cn}，确认 {params.get('confirmation_days', 1)} 天"
+    elif name == "DivergenceStrategy":
+        return (f"回顾 {params.get('lookback', 30)} 天，"
+                f"缩量阈值 < {params.get('volume_shrink_threshold', 0.7)}，"
+                f"价格峰窗口 {params.get('price_peak_window', 5)} 天")
+    elif name == "MomentumStrategy":
+        vol_str = f"，量比 ≥ {params.get('volume_multiplier', 1.2)}" if params.get('require_volume', True) else ""
+        return f"{params.get('period', 20)} 日涨幅 ≥ {params.get('roc_threshold', 0.05) * 100:.1f}%{vol_str}"
+    return ", ".join(f"{k}={v}" for k, v in params.items())
 
 
 def _format_detail(hit: dict) -> str:
@@ -191,7 +262,7 @@ def _format_detail(hit: dict) -> str:
             avg_vol = data.get("avg_volume", 0)
             recent = data.get("recent", [])
             ratios = [f"{r.get('ratio', 0):.1f}x" for r in recent]
-            parts.append(f"放量: 均值{format_volume(avg_vol)}, 倍数{','.join(ratios)}")
+            parts.append(f"放量: 均值{format_volume(avg_vol)}, 倍数 {' → '.join(ratios)}")
         elif strat_key == "MABreakoutStrategy":
             parts.append(
                 f"突破: {data.get('close', 0):.2f} "
@@ -279,24 +350,38 @@ def report_text(results: dict):
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"扫描时间: {results.get('scan_time', '')}\n")
-        f.write(f"策略: {', '.join(results.get('strategies', []))}\n")
         f.write(f"组合逻辑: {results.get('logic', 'or')}\n")
         f.write(f"命中: {len(hits)} / {stats.get('total_scanned', 0)} 只\n")
         f.write(f"耗时: {stats.get('duration_seconds', 0)}s\n")
+        f.write("-" * 80 + "\n")
+        # 策略及参数
+        strategy_params = results.get("strategy_params", {})
+        for s_name in results.get("strategies", []):
+            abbr = _STRATEGY_ABBR.get(s_name, s_name)
+            params = strategy_params.get(s_name, {})
+            desc = _format_strategy_desc(s_name, params)
+            f.write(f"策略: {s_name}（{abbr}），{desc}\n")
         f.write("=" * 80 + "\n\n")
 
-        for i, h in enumerate(hits, 1):
-            strats_hit = ", ".join(h.get("strategies", []))
-            f.write(f"{i}. {h.get('code', '')} {h.get('name', '')}  [{strats_hit}]\n")
-            detail = _format_detail(h)
-            if detail:
-                f.write(f"   {detail}\n")
+        # 表头
+        f.write(f"{'序号':<6} {'代码':<8} {'名称':<10} {'日期':<12} {'成交量':>10} {'策略':<8} {'策略详情'}\n")
+        f.write("-" * 120 + "\n")
 
-        # 各策略命中统计
+        for i, h in enumerate(hits, 1):
+            strats_abbr = _abbreviate_strategies(h)
+            date = _extract_date(h)
+            volume = _extract_volume(h)
+            detail = _format_detail(h)
+            f.write(f"{i:<6} {h.get('code', ''):<8} {h.get('name', ''):<10} {date:<12} {volume:>10} {strats_abbr:<8} {detail}\n")
+
+        # 各策略命中统计（单次遍历）
+        counts: dict[str, int] = {}
+        for h in hits:
+            for s_name in h.get("strategies", []):
+                counts[s_name] = counts.get(s_name, 0) + 1
         f.write("\n--- 策略命中统计 ---\n")
         for s_name in results.get("strategies", []):
-            count = sum(1 for h in hits if s_name in h.get("strategies", []))
-            f.write(f"  [{s_name}]: {count} 只\n")
+            f.write(f"  [{s_name}]: {counts.get(s_name, 0)} 只\n")
 
     logger.info(f"文本日志已保存: {path}")
 

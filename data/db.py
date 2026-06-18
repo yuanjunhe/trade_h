@@ -309,6 +309,19 @@ class Database:
             rows = conn.execute("SELECT code FROM stock_info").fetchall()
         return [r["code"] for r in rows]
 
+    def get_stock_info_df(self) -> pd.DataFrame:
+        """从 stock_info 表读取全量股票列表，返回 DataFrame。
+
+        列: code, name, market, board, is_st。
+        """
+        conn = self.get_conn()
+        rows = conn.execute(
+            "SELECT code, name, market, board, is_st FROM stock_info"
+        ).fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["code", "name", "market", "board", "is_st"])
+        return pd.DataFrame([dict(r) for r in rows])
+
     # ── download_state 增删改查 ──────────────────
 
     def get_download_state(self, code: str) -> dict | None:

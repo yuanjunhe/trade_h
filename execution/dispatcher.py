@@ -8,7 +8,7 @@ from datetime import datetime
 
 from data.db import Database
 from data.pipeline import daily_update, download_full_history
-from data.stock_list import filter_stocks, get_stock_list, sync_stock_info_to_db
+from data.stock_list import filter_stocks, sync_stock_info_to_db
 from execution.reporter import report_results
 from utils.config import get_config, load_config
 from utils.logging_setup import setup_logging
@@ -26,14 +26,13 @@ def _get_db() -> Database:
 
 
 def _get_stocks(db, board_filter: str = "all") -> list[dict]:
-    """获取过滤后的股票列表。
+    """从数据库 stock_info 表获取过滤后的股票列表。
 
     参数:
         db: Database 实例。
         board_filter: "all", "sh", "sz", "cy", "kcb"。
     """
-    sync_stock_info_to_db(db)
-    df = get_stock_list()
+    df = db.get_stock_info_df()
 
     # CLI 板块参数 → 配置格式映射
     if board_filter == "all":
@@ -61,6 +60,7 @@ def cmd_download(args):
         logger.info("重置数据库...")
         db.reset_all()
 
+    sync_stock_info_to_db(db)  # 确保 stock_info 表非空
     stocks = _get_stocks(db, args.board)
 
     if args.stocks > 0:
@@ -87,6 +87,7 @@ def cmd_download(args):
 def cmd_update(args):
     """处理 'update' 子命令。"""
     db = _get_db()
+    sync_stock_info_to_db(db)  # update 负责同步股票列表
     stocks = _get_stocks(db, "all")
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
 
