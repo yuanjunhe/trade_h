@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from utils.config import cfg
-from utils.helpers import format_pct, format_volume, get_recent_field
+from utils.helpers import format_volume, get_recent_field
 
 logger = logging.getLogger("quant.reporter")
 
@@ -87,20 +87,19 @@ def report_console(results: dict):
     max_rows = cfg("output", "console", "max_rows")
     display = hits[:max_rows]
 
-    # 表头
-    print(f"\n{'代码':<8} {'名称':<10} {'触发策略':<35} {'最新价':>8} {'涨跌幅':>8}")
-    print("-" * 90)
+    # 表头（与文本日志 report_text 列保持一致）
+    print(f"\n{'序号':<5} {'代码':<8} {'名称':<10} {'日期':<12} {'成交量':>10} {'策略':<8} {'策略详情'}")
+    print("-" * 120)
 
-    for h in display:
+    for i, h in enumerate(display, 1):
         code = h.get("code", "")
         name = h.get("name", "")
-        strats_hit = ", ".join(h.get("strategies", ["?"]))
-        close = _extract_close(h)
-        pct_change = _extract_pct_change(h)
-        close_str = f"{close:.2f}" if close else "---"
-        pct_str = format_pct(pct_change) if pct_change else "---"
+        strats_abbr = _abbreviate_strategies(h)
+        date = _extract_date(h)
+        volume = _extract_volume(h)
+        detail = _format_detail(h)
 
-        print(f"{code:<8} {name:<10} {strats_hit:<35} {close_str:>8} {pct_str:>8}")
+        print(f"{i:<5} {code:<8} {name:<10} {date:<12} {volume:>10} {strats_abbr:<8} {detail}")
 
     if len(hits) > max_rows:
         print(f"  ... 仅显示前 {max_rows} 只，共 {len(hits)} 只（完整结果见输出文件）")
@@ -121,17 +120,6 @@ def _extract_close(hit: dict) -> float | None:
         strat_data = hit.get(strat_key, {})
         if "close" in strat_data:
             return strat_data["close"]
-    return None
-
-
-def _extract_pct_change(hit: dict) -> float | None:
-    """从命中记录中提取涨跌幅相关信息。"""
-    for strat_key in hit.get("strategies", []):
-        strat_data = hit.get(strat_key, {})
-        if "roc_pct" in strat_data:
-            return strat_data["roc_pct"]
-        if "vol_ratio" in strat_data:
-            return (strat_data["vol_ratio"] - 1) * 100
     return None
 
 

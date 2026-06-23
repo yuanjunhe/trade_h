@@ -19,6 +19,7 @@ class VolumeSurgeStrategy(BaseStrategy):
         multiplier_min: float = 2.1 — 最低放量倍数
         multiplier_max: float = 0   — 最高放量倍数（0=不设上限）
         pass_ratio: float = 0.85    — 逐日对比通过率阈值
+        require_increasing: bool = True — check_days>=2 时，检查期成交量需逐日递增
     """
 
     def __init__(self, params: dict | None = None):
@@ -29,6 +30,7 @@ class VolumeSurgeStrategy(BaseStrategy):
         self.multiplier_max = self.params.get("multiplier_max", 0)
         self.pass_ratio = self.params.get("pass_ratio", 0.85)
         self.min_avg_volume = self.params.get("min_avg_volume", 0)
+        self.require_increasing = self.params.get("require_increasing", True)
 
     @property
     def required_days(self) -> int:
@@ -98,8 +100,14 @@ class VolumeSurgeStrategy(BaseStrategy):
 
         all_surged = bool(all(day_ok_flags))
 
+        # check_days>=2 时，要求检查期成交量逐日递增
+        # （最近一天 > 次最近一天 > ...）
+        increasing_ok = True
+        if self.require_increasing and len(recent_vols) >= 2:
+            increasing_ok = bool(np.all(np.diff(recent_vols) > 0))
+
         return {
-            "surged": all_surged,
+            "surged": all_surged and increasing_ok,
             "avg_volume": round(float(avg_vol), 2),
             "threshold_min": round(float(avg_vol * self.multiplier_min), 2),
             "threshold_max": (
